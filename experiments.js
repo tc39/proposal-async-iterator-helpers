@@ -1,12 +1,13 @@
 'use strict';
 
 let mapKind = Symbol('map');
+let filterKind = Symbol('map');
 
-let kinds = new Set([mapKind]);
+let kinds = new Set([mapKind, filterKind]);
 
 const assertUnreachable = () => { throw new Error('UNREACHABLE'); };
 
-class AsyncIteratorHelpers {
+class AsyncIteratorHelpers extends AsyncIterator {
   #kind;
   #helper;
 
@@ -14,11 +15,16 @@ class AsyncIteratorHelpers {
     if (!kinds.has(kind)) {
       throw new TypeError('AsyncIteratorHelpers is not constructible');
     }
+    super();
     this.#kind = kind;
     let HelperCtor;
     switch (kind) {
       case mapKind: {
         HelperCtor = MapHelper;
+        break;
+      }
+      case filterKind: {
+        HelperCtor = FilterHelper;
         break;
       }
     }
@@ -143,9 +149,9 @@ class WrapForValidAsyncIterator extends AsyncIterator {
 class MapHelper {
   #self;
   #inner;
-  #done = false; // once this becomes true, subsequent calls to .next() will always return { done: true, value: undefined }
-
   #fn;
+
+  #done = false; // once this becomes true, subsequent calls to .next() will always return { done: true, value: undefined }
   #mostRecentlyReturnedPromise = null;
   #counter = 0;
 
@@ -159,16 +165,21 @@ class MapHelper {
   }
 
   next() {
-    if (this.#done) {
-      return Promise.resolve({ done: true, value: undefined });
-    }
     let previousPromiseRejectedOrWasDone = false;
     let promise = new Promise(async (resolve, reject) => {
+      if (this.#done) {
+        resolve({ done: true, value: undefined });
+        return;
+      }
       let counter = this.#counter++;
       let done, value;
       try {
         ({ done, value} = await this.#inner.next());
       } catch (e) {
+        if (previousPromiseRejectedOrWasDone) {
+          resolve({ done: true, value: undefined });
+          return;
+        }
         // inner iterator threw or violated the protocol, so no need to close it
         this.#done = true;
         reject(e);
@@ -235,6 +246,165 @@ class MapHelper {
   }
 }
 
+class FilterHelper {
+  #self;
+  #inner;
+  #predicate;
+
+  #done = false; // once this becomes true, subsequent calls to .next() will always return { done: true, value: undefined }
+  #counter = 0;
+  // job items look like
+  // { status: 'running' | 'value' | 'threw' | 'done', value: unknown }
+  // with the `value` field meaningful only for the 'value' and 'threw' types
+  // there is always exactly one job item per unsettled call to `.next`
+  #jobs = [];
+  // capabilities look like { resolve, reject }
+  // there is always exactly one capability per unsettled call to `.next`
+  // this list is only popped when the head of the job queue is no longer 'running'
+  #capabilities = [];
+
+  constructor(self, inner, predicate) {
+    if (typeof predicate !== 'function') {
+      throw new TypeError('map expects a function');
+    }
+    this.#self = self;
+    this.#inner = inner;
+    this.#predicate = predicate;
+  }
+  
+  next() {
+    let resolve, reject;
+    // when Promise.build
+    let promise = new Promise((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    this.#capabilities.push({ resolve, reject });
+    this.#startJob();
+    return promise;
+  }
+  
+  async #startJob() {
+    if (this.#done) {
+      this.#jobs.push({ status: 'done' });
+      this.#maybeDrain();
+      return;
+    }
+
+    let job = { status: 'running', value: null };
+    this.#jobs.push(job);
+
+    let counter = this.#counter++;
+    let done, value;
+    // TODO refactor so the try/catches are shared, I guess
+    // though that's going to make mapping back to spec text harder...
+    try {
+      ({ done, value} = await this.#inner.next());
+    } catch (e) {
+      // inner iterator threw or violated the protocol, so no need to close it
+      if (job.status === 'running') {
+        job.status = 'threw';
+        job.value = e;
+        this.#finishedAt(job);
+      } else if (job.status === 'done') {
+        // already closed, nothing to do
+      } else {
+        assertUnreachable();
+      }
+      return;
+    }
+    if (done) {
+      if (job.status === 'running') {
+        this.#done = true;
+        job.status = 'done';
+        this.#finishedAt(job);
+      } else if (job.status === 'done') {
+        // already closed, nothing to do
+      } else {
+        assertUnreachable();
+      }
+      return;
+    }
+    let selected;
+    try {
+      selected = this.#predicate(value, counter);
+      // Set result to Completion(AwaitNonPrimitive(selected))
+      if (isAnObject(selected)) {
+        selected = await selected;
+      }
+    } catch (e) {
+      if (job.status === 'running') {
+        job.status = 'threw';
+        job.value = e;
+        try {
+          await asyncIteratorClose(this.#inner, { type: 'throw', value: e });
+          assertUnreachable();
+        } catch (e) {
+          // ignored
+        }
+        this.#finishedAt(job);
+      } else if (job.status === 'done') {
+        // already closed, nothing to do
+      } else {
+        assertUnreachable();
+      }
+      return;
+    }
+    if (selected) {
+      if (job.status === 'running') {
+        job.status = 'value';
+        job.value = value;
+        this.#maybeDrain();
+      } else if (job.status === 'done') {
+        // already closed, nothing to do
+      } else {
+        assertUnreachable();
+      }
+    } else {
+      if (job.status === 'running') {
+        this.#jobs.splice(this.#jobs.indexOf(job), 1);
+        this.#startJob();
+        this.#maybeDrain();
+      } else if (job.status === 'done') {
+        // already closed, nothing to do
+      } else {
+        assertUnreachable();
+      }
+    }
+  }
+  
+  #finishedAt(job) {
+    this.#done = true;
+    let index = this.#jobs.indexOf(job);
+    for (let i = index + 1; i < this.#jobs.length; ++i) {
+      this.#jobs[i].status = 'done';
+    }
+    this.#maybeDrain();
+  }
+  
+  // this should be invoked after any operation which may have caused the job at the head of the queue to be no longer running
+  #maybeDrain() {
+    while (this.#jobs.length > 0 && this.#jobs[0].status !== 'running') {
+      let job = this.#jobs.shift();
+      let { resolve, reject } = this.#capabilities.shift();
+      switch (job.status) {
+        case 'value': {
+          resolve({ done: false, value: job.value });
+          break;
+        }
+        case 'threw': {
+          reject(job.value);
+          break;
+        }
+        case 'done': {
+          resolve({ done: true, value: undefined });
+          break;
+        }
+      }
+    }
+  }
+}
+
 // let AsyncIteratorProto = (async function*(){})().__proto__.__proto__.__proto__;
 
 function AsyncIterator() {}
@@ -257,6 +427,10 @@ AsyncIteratorProto.map = function(fn) {
   return new AsyncIteratorHelpers(mapKind, this, fn);
 };
 
+AsyncIteratorProto.filter = function(predicate) {
+  return new AsyncIteratorHelpers(filterKind, this, predicate);
+};
+
 
 
 // TODO remove below here
@@ -272,15 +446,32 @@ let iter;
 
 // note that all the `sleep` calls happen in parallel
 // and the promises still resolve in order
-console.log('waiting for tasks of length 1, 3, 2, 1');
-iter = AsyncIterator.from([1, 3, 2, 1]).map(async x => {
+// console.log('waiting for tasks of length 1, 3, 2, 1');
+// iter = AsyncIterator.from([1, 3, 2, 1]).map(async x => {
+//   console.log('starting to wait for', x);
+//   await sleep(x/2 * 1000);
+//   console.log('done waiting for', x);
+//   return x;
+// });
+// iter.next().then(console.log);
+// iter.next().then(console.log);
+// iter.next().then(console.log);
+// iter.next().then(console.log);
+// iter.next().then(console.log);
+
+// note that, since there are only 4 calls to .next, we don't start the 5th wait until the predicate for the first has failed
+// also, even though the 1.1 job succeeds and passes the predicate before the throw triggered by 3.1, the corresponding call resolves to { done: true }
+iter = AsyncIterator.from([1, 3, 2, 3.1, 1.1]).map(async x => {
   console.log('starting to wait for', x);
   await sleep(x/2 * 1000);
   console.log('done waiting for', x);
   return x;
+}).filter(x => {
+  if (x === 3.1) { throw new Error('predicate throws for 3.1'); }
+  return x > 1;
 });
-iter.next().then(console.log);
-iter.next().then(console.log);
-iter.next().then(console.log);
-iter.next().then(console.log);
-iter.next().then(console.log);
+iter.next().then(console.log, console.log);
+iter.next().then(console.log, console.log);
+iter.next().then(console.log, console.log);
+iter.next().then(console.log, console.log);
+sleep(3000).then(() => { console.log('triggering next after completion'); iter.next().then(console.log, console.log); });
