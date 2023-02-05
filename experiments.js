@@ -1,11 +1,12 @@
 'use strict';
 
-let mapKind = Symbol('map');
-let filterKind = Symbol('map');
+const mapKind = Symbol('map');
+const filterKind = Symbol('map');
 
-let kinds = new Set([mapKind, filterKind]);
+const kinds = new Set([mapKind, filterKind]);
 
 const assertUnreachable = () => { throw new Error('UNREACHABLE'); };
+const assert = cond => { if (!cond) { throw new Error('assert failed'); } };
 
 class AsyncIteratorHelpers extends AsyncIterator {
   #kind;
@@ -302,27 +303,20 @@ class FilterHelper {
       ({ done, value} = await this.#inner.next());
     } catch (e) {
       // inner iterator threw or violated the protocol, so no need to close it
-      if (job.status === 'running') {
-        job.status = 'threw';
-        job.value = e;
-        this.#finishedAt(job);
-      } else if (job.status === 'done') {
-        // already closed, nothing to do
-      } else {
-        assertUnreachable();
-      }
+      if (job.status === 'done') return;
+      assert(job.status === 'running');
+
+      job.status = 'threw';
+      job.value = e;
+      this.#finishedAt(job);
       return;
     }
     if (done) {
-      if (job.status === 'running') {
-        this.#done = true;
-        job.status = 'done';
-        this.#finishedAt(job);
-      } else if (job.status === 'done') {
-        // already closed, nothing to do
-      } else {
-        assertUnreachable();
-      }
+      if (job.status === 'done') return;
+      assert(job.status === 'running');
+
+      job.status = 'done';
+      this.#finishedAt(job);
       return;
     }
     let selected;
@@ -333,43 +327,31 @@ class FilterHelper {
         selected = await selected;
       }
     } catch (e) {
-      if (job.status === 'running') {
-        job.status = 'threw';
-        job.value = e;
-        try {
-          await asyncIteratorClose(this.#inner, { type: 'throw', value: e });
-          assertUnreachable();
-        } catch (e) {
-          // ignored
-        }
-        this.#finishedAt(job);
-      } else if (job.status === 'done') {
-        // already closed, nothing to do
-      } else {
+      if (job.status === 'done') return;
+      assert(job.status === 'running');
+
+      job.status = 'threw';
+      job.value = e;
+      try {
+        await asyncIteratorClose(this.#inner, { type: 'throw', value: e });
         assertUnreachable();
+      } catch (e) {
+        // ignored
       }
+      this.#finishedAt(job);
       return;
     }
+    if (job.status === 'done') return;
+    assert(job.status === 'running');
+
     if (selected) {
-      if (job.status === 'running') {
-        job.status = 'value';
-        job.value = value;
-        this.#maybeDrain();
-      } else if (job.status === 'done') {
-        // already closed, nothing to do
-      } else {
-        assertUnreachable();
-      }
+      job.status = 'value';
+      job.value = value;
+      this.#maybeDrain();
     } else {
-      if (job.status === 'running') {
-        this.#jobs.splice(this.#jobs.indexOf(job), 1);
-        this.#startJob();
-        this.#maybeDrain();
-      } else if (job.status === 'done') {
-        // already closed, nothing to do
-      } else {
-        assertUnreachable();
-      }
+      this.#jobs.splice(this.#jobs.indexOf(job), 1);
+      this.#startJob();
+      this.#maybeDrain();
     }
   }
   
