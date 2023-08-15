@@ -79,6 +79,27 @@ class BaseHelper {
     return promise;
   }
 
+  threw(job, value, shouldClose) {
+    if (job.status === 'done') return;
+    assert(job.status === 'running');
+
+    if (shouldClose) {
+      // TODO return
+    }
+
+    job.status = 'threw';
+    job.value = e;
+    this.finishedAt(job);
+  }
+
+  gotDone(job, value) {
+    if (job.status === 'done') return;
+    assert(job.status === 'running');
+
+    job.status = 'done';
+    this.finishedAt(job);
+  }
+
   finishedAt(job) {
     this.done = true;
     let index = this.jobs.indexOf(job);
@@ -148,22 +169,11 @@ class MapHelper extends BaseHelper {
     try {
       ({ done, value} = await this.#underlying.next());
     } catch (e) {
-      if (job.status === 'done') return;
-      assert(job.status === 'running');
-
-      // underlying iterator threw or violated the protocol, so no need to close it
-
-      job.status = 'threw';
-      job.value = e;
-      this.finishedAt(job);
+      this.threw(job, e, false);
       return;
     }
     if (done) {
-      if (job.status === 'done') return;
-      assert(job.status === 'running');
-
-      job.status = 'done';
-      this.finishedAt(job);
+      this.gotDone(job);
       return;
     }
     let mapped;
@@ -173,14 +183,7 @@ class MapHelper extends BaseHelper {
         mapped = await mapped;
       }
     } catch (e) {
-      if (job.status === 'done') return;
-      assert(job.status === 'running');
-
-      // TODO close underlying here
-
-      job.status = 'threw';
-      job.value = e;
-      this.finishedAt(job);
+      this.threw(job, e, true);
       return;
     }
     if (job.status === 'done') return;
@@ -218,36 +221,18 @@ class FilterHelper extends BaseHelper {
     try {
       ({ done, value} = await this.#underlying.next());
     } catch (e) {
-      if (job.status === 'done') return;
-      assert(job.status === 'running');
-
-      // underlying iterator threw or violated the protocol, so no need to close it
-
-      job.status = 'threw';
-      job.value = e;
-      this.finishedAt(job);
+      this.threw(job, e, false);
       return;
     }
     if (done) {
-      if (job.status === 'done') return;
-      assert(job.status === 'running');
-
-      job.status = 'done';
-      this.finishedAt(job);
+      this.gotDone(job);
       return;
     }
     let selected;
     try {
       selected = this.#predicate(value, counter);
     } catch (e) {
-      if (job.status === 'done') return;
-      assert(job.status === 'running');
-
-      // TODO close underlying here
-
-      job.status = 'threw';
-      job.value = e;
-      this.finishedAt(job);
+      this.threw(job, e, true);
       return;
     }
     if (job.status === 'done') return;
