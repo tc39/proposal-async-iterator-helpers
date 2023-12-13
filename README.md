@@ -60,3 +60,38 @@ This proposal introduces two new intrisic objects, in addition to the two added 
 const AsyncIteratorHelperPrototype = Object.getPrototypeOf(AsyncIterator.from([]).take(0));
 const WrapForValidAsyncIteratorPrototype = Object.getPrototypeOf(AsyncIterator.from({ async next(){} }));
 ```
+
+## More Example Usage
+
+### Lazy Iteration over sets
+
+Iterating over a set of URLs, asynchronously fetching each, and returning an array of their
+JSON Output.
+
+```js
+const responses = await AsyncIterator.from(urls)
+  .map(async (url) => {
+    const response = await fetch(url);
+    return response.json();
+  })
+  .toArray();
+```
+
+Example of iterating over a potentially infinite iterator and transforming it to an array in groups
+of 5.
+
+```js
+class ObligatoryCryptocurrencyReference extends Component {
+  componentWillMount() {
+    const items = ticker() // returns async iterator
+      .map((c) => createElement('h2', null, `${c.name}: ${c.price}`))
+      .take(5) // only consume 5 items of a potentially infinite iterator
+      .toArray() // greedily transform async iterator into array
+      .then((data) => this.setState({ data }));
+  }
+
+  render() {
+    return createElement('div', null, this.state.data);
+  }
+}
+```
