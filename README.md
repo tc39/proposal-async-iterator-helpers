@@ -39,7 +39,7 @@ See [proposal-iterator-helpers](https://github.com/tc39/proposal-iterator-helper
 In the iterator-producing methods (`.map`, `.filter`, `.take`, `.drop`, and `.flatMap`), async helpers have the opportunity to support _concurrency_. For example, in the following code:
 
 ```js
-asyncIteratorOfUrls
+x = asyncIteratorOfUrls
   .map(u => fetch(u))
 
 await Promise.all([
